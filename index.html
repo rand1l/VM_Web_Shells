@@ -1,99 +1,163 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Web Terminal</title>
+
+    <!-- Link to xterm.js CSS -->
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm/css/xterm.css" />
+
+    <!-- Include xterm.js library -->
     <script src="https://cdn.jsdelivr.net/npm/xterm/lib/xterm.js"></script>
+
     <style>
-        body, html { margin: 0; padding: 0; height: 100%; width: 100%; }
-        #terminal { height: 80%; width: 100%; }
-        #buttons { display: flex; justify-content: center; gap: 10px; margin-top: 10px; }
+        /* Basic Reset */
+        body, html {
+            margin: 0;
+            padding: 0;
+            height: 100%;
+            width: 100%;
+            font-family: Arial, sans-serif;
+        }
+
+        /* Terminal container */
+        #terminal {
+            height: 80%;
+            width: 100%;
+            background-color: black;
+        }
+
+        /* Buttons container */
+        #buttons {
+            display: flex;
+            justify-content: center;
+            gap: 10px;
+            margin-top: 10px;
+        }
+
+        /* Button styling */
+        button {
+            padding: 10px 20px;
+            font-size: 16px;
+            cursor: pointer;
+            border: 1px solid #ccc;
+            background-color: #333;
+            color: white;
+        }
+
+        button:hover {
+            background-color: #555;
+        }
     </style>
 </head>
+
 <body>
+
 <div id="terminal"></div>
+
 <div id="buttons">
     <button onclick="connectToMachine('1')">Connect to Machine 1</button>
     <button onclick="connectToMachine('2')">Connect to Machine 2</button>
 </div>
-<script>
-    var term = new Terminal();
-    term.open(document.getElementById('terminal'));
-    var currentSocket = null;
-    var sessionID = null;
 
-    term.onData(function(data) {
+<script>
+    // Initialize terminal
+    const term = new Terminal();
+    term.open(document.getElementById('terminal'));
+
+    let currentSocket = null;
+    let sessionID = null;
+
+    // On terminal data, send to WebSocket
+    term.onData((data) => {
         if (currentSocket && currentSocket.readyState === WebSocket.OPEN) {
             currentSocket.send(data);
         }
     });
 
+    // Helper function to get session ID
     function getSessionID(callback) {
         if (sessionID) {
             callback();
             return;
         }
-        fetch('/create_session').then(response => {
-            if (response.ok) {
-                response.json().then(data => {
-                    sessionID = data.sessionID;
-                    callback();
-                }).catch(err => {
-                    console.error('Error parsing JSON:', err);
-                    term.write("Session creation error.\r\n");
-                });
-            } else {
-                term.write("Session creation error.\r\n");
-            }
-        }).catch(error => {
-            console.error('Error:', error);
-            term.write("Server connection error.\r\n");
-        });
+
+        // Create session if not already present
+        fetch('/create_session')
+            .then(response => {
+                if (response.ok) {
+                    return response.json();
+                } else {
+                    throw new Error('Session creation failed');
+                }
+            })
+            .then(data => {
+                sessionID = data.sessionID;
+                callback();
+            })
+            .catch((error) => {
+                console.error('Error:', error);
+                term.write("Error creating session.\r\n");
+            });
     }
 
+    // Function to connect to machine
     function connectToMachine(machineId) {
+        // Close any existing WebSocket connection
         if (currentSocket) {
             currentSocket.close();
             currentSocket = null;
         }
 
-        getSessionID(function() {
+        // Get session ID and then initiate WebSocket connection
+        getSessionID(() => {
             initiateWebSocket(machineId);
         });
     }
 
+    // Function to initialize WebSocket connection
     function initiateWebSocket(machineId) {
-        currentSocket = new WebSocket('ws://' + window.location.host + '/ws?sessionID=' + sessionID + '&machine=' + machineId);
+        // Use HTTPS if possible
+        const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsURL = `${wsProtocol}//${window.location.host}/ws?sessionID=${sessionID}&machine=${machineId}`;
+        currentSocket = new WebSocket(wsURL);
         currentSocket.binaryType = 'arraybuffer';
 
-        currentSocket.onopen = function() {
+        // WebSocket event listeners
+        currentSocket.onopen = () => {
             term.clear();
-            term.write("Connection to Machine " + machineId + " in session " + sessionID + " established\r\n");
+            term.write(`Connection to Machine ${machineId} in session ${sessionID} established\r\n`);
         };
 
-        currentSocket.onmessage = function(event) {
-            var data = new Uint8Array(event.data);
+        currentSocket.onmessage = (event) => {
+            const data = new Uint8Array(event.data);
             term.write(new TextDecoder().decode(data));
         };
 
-        currentSocket.onclose = function() {
+        currentSocket.onclose = () => {
             term.write("\r\nConnection closed.\r\n");
         };
 
-        currentSocket.onerror = function(error) {
+        currentSocket.onerror = (error) => {
             console.log("WebSocket error: ", error);
+            term.write("WebSocket error occurred.\r\n");
         };
     }
 
-    window.addEventListener('beforeunload', function(event) {
+    // Cleanup and close session on page unload
+    window.addEventListener('beforeunload', function () {
         if (sessionID) {
-            navigator.sendBeacon('/close_session?sessionID=' + encodeURIComponent(sessionID));
+            navigator.sendBeacon(`/close_session?sessionID=${encodeURIComponent(sessionID)}`);
         }
     });
 </script>
+
 </body>
+
 </html>
+
 
 
 

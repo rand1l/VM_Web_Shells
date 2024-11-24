@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -24,16 +25,16 @@ type Session struct {
 	tapNames   map[string]string // Key - Machine ID, Value - TAP name
 	ptyFiles   map[string]*os.File
 	cmds       map[string]*exec.Cmd
-	lastActive time.Time
+	lastActive time.Time // Last activity time
 }
 
 var (
 	sessions   = make(map[string]*Session)
 	sessionsMu sync.Mutex
 	upgrader   = websocket.Upgrader{
-		CheckOrigin: func(r *http.Request) bool { return true },
+		CheckOrigin: func(r *http.Request) bool { return true }, // Consider tightening in production
 	}
-	sessionTimeout = 10 * time.Minute // Session timeout
+	sessionTimeout = 10 * time.Minute // Session timeout duration
 )
 
 func main() {
@@ -46,31 +47,39 @@ func main() {
 	go sessionCleaner()
 
 	fmt.Println("Server started on port :8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	if err := http.ListenAndServe(":8080", nil); err != nil {
+		log.Fatalf("Server failed to start: %v", err)
+	}
 }
 
 // indexHandler handles the root route and returns the HTML page
-func indexHandler(w http.ResponseWriter, r *http.Request) {
+func indexHandler(w http.ResponseWriter, _ *http.Request) {
 	html, err := os.ReadFile("index.html")
 	if err != nil {
 		http.Error(w, "Error reading HTML file", http.StatusInternalServerError)
+		log.Printf("Error reading index.html: %v", err)
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Write(html)
+	if _, err := w.Write(html); err != nil {
+		log.Printf("Error writing HTML response: %v", err)
+	}
 }
 
 // createSessionHandler creates a new session and returns the sessionID
-func createSessionHandler(w http.ResponseWriter, r *http.Request) {
+func createSessionHandler(w http.ResponseWriter, _ *http.Request) {
 	session, err := createSession()
 	if err != nil {
-		log.Println("Error creating session:", err)
+		log.Printf("Error creating session: %v", err)
 		http.Error(w, "Error creating session", http.StatusInternalServerError)
 		return
 	}
 	// Return sessionID in JSON response
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"sessionID": session.hash})
+	if err := json.NewEncoder(w).Encode(map[string]string{"sessionID": session.hash}); err != nil {
+		log.Printf("Error encoding JSON response: %v", err)
+		http.Error(w, "Error creating session", http.StatusInternalServerError)
+	}
 }
 
 // closeSessionHandler terminates the session and cleans up resources
@@ -91,6 +100,7 @@ func closeSessionHandler(w http.ResponseWriter, r *http.Request) {
 	delete(sessions, sessionID)
 	sessionsMu.Unlock()
 
+	// Clean up session resources
 	cleanupSession(session)
 	log.Printf("Session %s terminated by client request", sessionID)
 	w.WriteHeader(http.StatusOK)
@@ -125,15 +135,21 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	// Establish WebSocket connection
 	wsConn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Println("Error upgrading to WebSocket:", err)
+		log.Printf("Error upgrading to WebSocket: %v", err)
 		return
 	}
-	defer wsConn.Close()
+	defer func() {
+		if err := wsConn.Close(); err != nil {
+			log.Printf("Error closing WebSocket: %v", err)
+		}
+	}()
 
 	ptmx, ok := session.ptyFiles[machineID]
 	if !ok {
-		log.Println("Invalid machine ID:", machineID)
-		wsConn.WriteMessage(websocket.TextMessage, []byte("Invalid machine ID"))
+		log.Printf("Invalid machine ID: %s", machineID)
+		if err := wsConn.WriteMessage(websocket.TextMessage, []byte("Invalid machine ID")); err != nil {
+			log.Printf("Error sending invalid machine ID message: %v", err)
+		}
 		return
 	}
 
@@ -143,12 +159,19 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		for {
 			n, err := ptmx.Read(buf)
 			if err != nil {
-				log.Println("Error reading from PTY:", err)
-				wsConn.Close()
+				if errors.Is(err, os.ErrClosed) || strings.Contains(err.Error(), "use of closed network connection") {
+					// PTY closed, exit gracefully
+					log.Printf("PTY closed for machine %s: %v", machineID, err)
+				} else {
+					log.Printf("Error reading from PTY: %v", err)
+				}
+				if err := wsConn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "")); err != nil {
+					log.Printf("Error sending close message to WebSocket: %v", err)
+				}
 				break
 			}
 			if err := wsConn.WriteMessage(websocket.BinaryMessage, buf[:n]); err != nil {
-				log.Println("Error writing to WebSocket:", err)
+				log.Printf("Error writing to WebSocket: %v", err)
 				break
 			}
 		}
@@ -158,16 +181,21 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	for {
 		messageType, msg, err := wsConn.ReadMessage()
 		if err != nil {
-			log.Println("Error reading from WebSocket:", err)
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				log.Printf("Unexpected WebSocket close: %v", err)
+			} else {
+				log.Printf("WebSocket read error: %v", err)
+			}
 			break
 		}
 		if messageType == websocket.BinaryMessage || messageType == websocket.TextMessage {
 			if _, err := ptmx.Write(msg); err != nil {
-				log.Println("Error writing to machine PTY:", err)
+				log.Printf("Error writing to machine PTY: %v", err)
 				break
 			}
 		}
 
+		// Update the last activity time of the session
 		sessionsMu.Lock()
 		session.lastActive = time.Now()
 		sessionsMu.Unlock()
@@ -185,6 +213,7 @@ func createSession() (*Session, error) {
 	tap1Name := fmt.Sprintf("tap1-%s", hash)
 	tap2Name := fmt.Sprintf("tap2-%s", hash)
 
+	// Ensure the names do not exceed the length limit
 	if len(bridgeName) > 15 || len(tap1Name) > 15 || len(tap2Name) > 15 {
 		return nil, fmt.Errorf("interface name too long: %s, %s, %s", bridgeName, tap1Name, tap2Name)
 	}
@@ -198,16 +227,24 @@ func createSession() (*Session, error) {
 		lastActive: time.Now(), // Set the session creation time
 	}
 
+	// Set up the network for the session
 	if err := setupNetwork(session); err != nil {
 		return nil, fmt.Errorf("failed to set up network: %v", err)
 	}
 
+	// Start virtual machines
 	if err := startMachine(session, "1", tap1Name); err != nil {
-		cleanupNetwork(session)
+		err := cleanupNetwork(session)
+		if err != nil {
+			return nil, err
+		}
 		return nil, fmt.Errorf("failed to start machine 1: %v", err)
 	}
 	if err := startMachine(session, "2", tap2Name); err != nil {
-		cleanupNetwork(session)
+		err := cleanupNetwork(session)
+		if err != nil {
+			return nil, err
+		}
 		return nil, fmt.Errorf("failed to start machine 2: %v", err)
 	}
 
@@ -236,7 +273,9 @@ func cleanupSession(session *Session) {
 	// Close PTYs
 	for _, pt := range session.ptyFiles {
 		if pt != nil {
-			pt.Close()
+			if err := pt.Close(); err != nil {
+				log.Printf("Error closing PTY: %v", err)
+			}
 		}
 	}
 
@@ -282,9 +321,11 @@ func generateShortHash(length int) (string, error) {
 
 // setupNetwork configures network interfaces for the session
 func setupNetwork(session *Session) error {
-	if exists, err := interfaceExists(session.bridgeName); err != nil {
+	exists, err := interfaceExists(session.bridgeName)
+	if err != nil {
 		return fmt.Errorf("error checking existence of bridge %s: %v", session.bridgeName, err)
-	} else if exists {
+	}
+	if exists {
 		log.Printf("Bridge %s already exists. Deleting...", session.bridgeName)
 		if err := runCommand("ip", "link", "delete", session.bridgeName, "type", "bridge"); err != nil {
 			return fmt.Errorf("failed to delete bridge %s: %v", session.bridgeName, err)
@@ -337,7 +378,7 @@ func cleanupNetwork(session *Session) error {
 	for _, cmdArgs := range commands {
 		if err := runCommand(cmdArgs...); err != nil {
 			if strings.Contains(err.Error(), "Cannot find device") || strings.Contains(err.Error(), "No such device") {
-				continue
+				continue // Device already removed or does not exist
 			}
 			log.Printf("Error executing cleanup command %v: %v", cmdArgs, err)
 		} else {
@@ -365,6 +406,10 @@ func interfaceExists(name string) (bool, error) {
 
 // runCommand executes a system command and returns an error if it occurred
 func runCommand(args ...string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("no command provided")
+	}
+
 	cmd := exec.Command(args[0], args[1:]...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -373,15 +418,24 @@ func runCommand(args ...string) error {
 	return nil
 }
 
-// startMachine launches a virtual machine with connects it to the TAP device
+// startMachine launches a virtual machine and connects it to the TAP device
 func startMachine(session *Session, machineID string, tapDevice string) error {
 	netDevID := fmt.Sprintf("net%s", machineID)
+
+	// Ensure machineID is a valid digit and convert to integer
+	if len(machineID) != 1 || machineID[0] < '0' || machineID[0] > '9' {
+		return fmt.Errorf("invalid machine ID: %s", machineID)
+	}
+	machineNum := int(machineID[0] - '0') // Convert '1' -> 1, '2' -> 2, etc.
+
+	macSuffix := 100 + machineNum // Example: 1 -> 101, 2 -> 102
+
 	cmd := exec.Command("qemu-system-x86_64",
 		"-accel", "kvm",
 		"-drive", fmt.Sprintf("file=debian-12-nocloud-amd64.qcow2,format=qcow2,if=virtio"),
 		"-display", "none",
 		"-netdev", fmt.Sprintf("tap,ifname=%s,id=%s,script=no,downscript=no", tapDevice, netDevID),
-		"-device", fmt.Sprintf("virtio-net-pci,netdev=%s,mac=e6:c8:ff:09:76:%02x", netDevID, 100+machineID[0]),
+		"-device", fmt.Sprintf("virtio-net-pci,netdev=%s,mac=e6:c8:ff:09:76:%02x", netDevID, macSuffix),
 		"-chardev", "stdio,id=char0,signal=off",
 		"-serial", "chardev:char0",
 		"-m", "256",
