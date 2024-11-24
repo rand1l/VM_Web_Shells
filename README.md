@@ -13,9 +13,3 @@ This project on Go implements a web-based terminal for interacting with virtual 
 1. A session is created by calling the `/create_session` endpoint, generating a unique session ID.
 2. Users can connect to either VM1 or VM2 through WebSocket, with terminal data sent back and forth.
 3. The session is automatically cleaned up after inactivity or when the user navigates away from the page.
-
-## Use Cases:
-This project is useful for scenarios where you need to provide terminal access to virtual machines remotely, such as:
-- Cloud-based development environments
-- Remote server management
-- Testing and automation platforms
