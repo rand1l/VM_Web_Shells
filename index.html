@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Web Terminal</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm/css/xterm.css" />
+    <script src="https://cdn.jsdelivr.net/npm/xterm/lib/xterm.js"></script>
+    <style>
+        body, html { margin: 0; padding: 0; height: 100%; width: 100%; }
+        #terminal { height: 80%; width: 100%; }
+        #buttons { display: flex; justify-content: center; gap: 10px; margin-top: 10px; }
+    </style>
+</head>
+<body>
+<div id="terminal"></div>
+<div id="buttons">
+    <button onclick="connectToMachine('1')">Connect to Machine 1</button>
+    <button onclick="connectToMachine('2')">Connect to Machine 2</button>
+</div>
+<script>
+    var term = new Terminal();
+    term.open(document.getElementById('terminal'));
+    var currentSocket = null;
+    var sessionID = null;
+
+    term.onData(function(data) {
+        if (currentSocket && currentSocket.readyState === WebSocket.OPEN) {
+            currentSocket.send(data);
+        }
+    });
+
+    function getSessionID(callback) {
+        if (sessionID) {
+            callback();
+            return;
+        }
+        fetch('/create_session').then(response => {
+            if (response.ok) {
+                response.json().then(data => {
+                    sessionID = data.sessionID;
+                    callback();
+                }).catch(err => {
+                    console.error('Error parsing JSON:', err);
+                    term.write("Session creation error.\r\n");
+                });
+            } else {
+                term.write("Session creation error.\r\n");
+            }
+        }).catch(error => {
+            console.error('Error:', error);
+            term.write("Server connection error.\r\n");
+        });
+    }
+
+    function connectToMachine(machineId) {
+        if (currentSocket) {
+            currentSocket.close();
+            currentSocket = null;
+        }
+
+        getSessionID(function() {
+            initiateWebSocket(machineId);
+        });
+    }
+
+    function initiateWebSocket(machineId) {
+        currentSocket = new WebSocket('ws://' + window.location.host + '/ws?sessionID=' + sessionID + '&machine=' + machineId);
+        currentSocket.binaryType = 'arraybuffer';
+
+        currentSocket.onopen = function() {
+            term.clear();
+            term.write("Connection to Machine " + machineId + " in session " + sessionID + " established\r\n");
+        };
+
+        currentSocket.onmessage = function(event) {
+            var data = new Uint8Array(event.data);
+            term.write(new TextDecoder().decode(data));
+        };
+
+        currentSocket.onclose = function() {
+            term.write("\r\nConnection closed.\r\n");
+        };
+
+        currentSocket.onerror = function(error) {
+            console.log("WebSocket error: ", error);
+        };
+    }
+
+    window.addEventListener('beforeunload', function(event) {
+        if (sessionID) {
+            navigator.sendBeacon('/close_session?sessionID=' + encodeURIComponent(sessionID));
+        }
+    });
+</script>
+</body>
+</html>
+
+
+
